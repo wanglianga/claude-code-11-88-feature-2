@@ -24,18 +24,18 @@
 [PASS] 闭包对象数=7 
     单次恢复：取回费=12.16 恢复计算费=4.98 合计=17.14 元
 [PASS] 72h窗口内完成全部预取 累计=13.0h
-[PASS] 分摊总额等于月账单（allocationCheck） 总额=342.255
-    月存储费：PROJ-A=305.19 PROJ-B=19.92 合计=342.25 元/月
+[PASS] 分摊总额等于月账单（allocationCheck） 总额=359.4
+    月存储费：PROJ-A=305.19 PROJ-B=19.92 合计=359.4 元/月
 [PASS] PROJ-A 存储费与手工口径一致（含共享份额扣减） api=305.19 manual=305.19
 [PASS] 共享掩膜按冻结份额 30% 分摊给 PROJ-B 
 [PASS] 共享对象 MASK-A01 份额之和=1 
 [PASS] 共享对象 ALGO-PKG-01 份额之和=1 
 [PASS] 恢复计划执行成功且在RTO内 
 [PASS] 恢复对象数=7 
-[PASS] 取回费已计入月账单 24.33
-[PASS] 恢复计算费已计入月账单 9.96
+[PASS] 取回费已计入月账单 36.495
+[PASS] 恢复计算费已计入月账单 14.94
 [PASS] 含取回后分摊核对仍通过 
-    年存储费（两项目合计口径）≈4312.799999999999 元；研究A单次恢复合计=17.14 元，年1次取回年成本=17.14 元
+    年存储费（两项目合计口径）≈4518.6 元；研究A单次恢复合计=17.14 元，年1次取回年成本=17.14 元
 [PASS] 年1次：按需预取路线更省 按需=17.15 恢复包=65.01
 [PASS] 月1次：恢复包路线更省（额外占用低于重复取回） 按需=205.74 恢复包=67.32
     盈亏平衡频次≈3.83 次/年；恢复包月费=5.4 元（30GB×0.18）
@@ -47,18 +47,42 @@
 [PASS] 校准恢复后恢复包校验通过 
 [PASS] 恢复包路线月频计划可满足且≤4h 
 [PASS] 缺算法包时即使哈希通过也判定不可复现 
-[PASS] 项目A退出后共享掩膜/算法包被研究B引用保护，不得整体删除 {'ALGO-PKG-01', 'MASK-A01'}
+[PASS] 项目A退出后共享掩膜/算法包被研究B引用保护，不得整体删除 {'MASK-A01', 'ALGO-PKG-01'}
 [PASS] 项目A独占对象标记退出（RAW-IMG-A01） 
 [PASS] 研究B对象不受项目A退出影响 
 [PASS] 共享掩膜销毁检查=BLOCKED_SHARED_REFERENCE BLOCKED_SHARED_REFERENCE
-[PASS] 快照固定目录水位/依赖/费率版本 {'catalogObjects': 10, 'decisions': 20, 'rateVersion': 'RV-2026Q4', 'snapshotDate': '2026-11-25', 'snapshotId': 3, 'lineageEdges': 9, 'billingEntries': 2}
-[PASS] 快照可回放保留/冻结/迁移/退出等治理决定 {'RETENTION', 'LITIGATION_HOLD', 'LITIGATION_HOLD_RELEASED', 'CHECKSUM_FAILED', 'PROJECT_WITHDRAWN'}
+[PASS] 快照固定目录水位/依赖/费率版本 {'billingEntries': 2, 'catalogObjects': 10, 'decisions': 30, 'rateVersion': 'RV-2026Q4', 'snapshotDate': '2026-11-25', 'snapshotId': 7, 'lineageEdges': 9}
+[PASS] 快照可回放保留/冻结/迁移/退出等治理决定 {'LITIGATION_HOLD_RELEASED', 'CHECKSUM_FAILED', 'RETENTION', 'LITIGATION_HOLD', 'PROJECT_WITHDRAWN'}
+[PASS] 共享账单总额=19 元 grand=19.0
+[PASS] 双路线对账通过（REFERENCE_WEIGHT：分摊=总额） {'method': 'REFERENCE_WEIGHT', 'totalStorageFee': 15.0, 'totalReadFee': 4.0, 'grandTotalFee': 19.0, 'allocatedTotal': 19.0, 'reconciled': True}
+[PASS] 双路线对账通过（SHAPLEY：分摊=总额） {'method': 'SHAPLEY', 'totalStorageFee': 15.0, 'totalReadFee': 4.0, 'grandTotalFee': 19.0, 'allocatedTotal': 19.0, 'reconciled': True}
+[PASS] 权重路线 O1 按 3:1 分摊：A=7.50 
+[PASS] 权重路线 O1 按 3:1 分摊：B=2.50 
+[PASS] 权重路线项目合计 A=12.90（7.50+3.00+2.40） {'projectCode': 'PROJ-A', 'billingMonth': '2026-11', 'method': 'REFERENCE_WEIGHT', 'sharedStorageFee': 7.5, 'exclusiveStorageFee': 3.0, 'readFee': 2.4, 'totalFee': 12.9, 'projectId': 1}
+[PASS] 权重路线项目合计 B=6.10（2.50+2.00+1.60） 
+[PASS] Shapley 路线 O1 各承担 5.00（移除单项目省不下共享基础成本） 
+[PASS] Shapley 路线项目合计 A=10.40 
+[PASS] Shapley 路线项目合计 B=8.60 
+[PASS] REFERENCE_WEIGHT 读取费直接归属 A=2.40/B=1.60 
+[PASS] REFERENCE_WEIGHT 专属资源账 A=3.00/B=2.00 
+[PASS] SHAPLEY 读取费直接归属 A=2.40/B=1.60 
+[PASS] SHAPLEY 专属资源账 A=3.00/B=2.00 
+[PASS] O1 引用权重 A=0.75/B=0.25 
+[PASS] O1 Shapley 平均边际成本各=5.00 
+[PASS] 字节时长账 3 对象×30 天=90 行 rows=90
+[PASS] O1 字节时长账月存储费合计=10.00 
+[PASS] 专属资源账 DERIV-A=3.00/DERIV-B=2.00 
+[PASS] 撤销引用登记为下月生效且本月快照不变 
+[PASS] 撤销后 2026-11 账单不变（A=12.90/B=6.10） 
+[PASS] 2026-11 成员快照仍含 PROJ-B 
+[PASS] 2026-12 O1 全部 10 元归 A、B 不再分摊共享费 
+[PASS] 2026-12 单成员联盟两路线仍对账 
+[PASS] 2026-12 快照 PROJ-B 已退出联盟 
+[PASS] 恢复引用后新账期按新成员集重算：O1 回到 A 7.50/B 2.50 
+[PASS] 已出账的 2026-12 快照/账单保持不可变（B 分摊仍为 0） 
+[PASS] 读取量按项目直接归属（A=100GB→2.00，总额 18.60 仍对账） 
+[PASS] 场景重置后恢复题设 19 元与 A=12.90/B=6.10 
 
 ================ 验证汇总 ================
-通过 51 项，失败 0 项
+通过 80 项，失败 0 项
 全部场景验证通过
-
-## 补充验证（手工 curl / 构建）
-- reviewer 账号 GET /api/catalog/objects -> 200；POST /api/retention/hold -> 403（只读角色）
-- mvn test: Tests run: 8, Failures: 0, Errors: 0
-- npm run build: 99 modules transformed, built 成功

@@ -8,6 +8,7 @@ const routes = [
   { path: '/retention', component: () => import('../views/RetentionView.vue'), meta: { title: '保留策略与传播' } },
   { path: '/restore', component: () => import('../views/RestoreView.vue'), meta: { title: '恢复计划与校验' } },
   { path: '/cost', component: () => import('../views/CostView.vue'), meta: { title: '成本账与分摊' } },
+  { path: '/cost-share', component: () => import('../views/CostShareView.vue'), meta: { title: '共享账单双路线分摊' } },
   { path: '/snapshots', component: () => import('../views/SnapshotView.vue'), meta: { title: '归档快照回放' } },
   { path: '/projects', component: () => import('../views/ProjectView.vue'), meta: { title: '项目审阅' } }
 ]

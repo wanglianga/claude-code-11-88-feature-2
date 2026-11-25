@@ -11,6 +11,7 @@
   6. 两路线盈亏平衡（年1次 vs 月1次）
   7. 项目退出共享对象保护
   8. 归档快照回放
+  9. 共享影像湖仓账单双路线分摊（引用权重 3:1 / Shapley 边际成本；总额 19 元；撤销引用跨周期重算）
 用法: python3 verify_e2e.py [base_url]
 """
 import json
@@ -245,6 +246,105 @@ kinds = {d.get("kind") for d in decisions if isinstance(d, dict)}
 check("快照可回放保留/冻结/迁移/退出等治理决定",
       {"RETENTION", "LITIGATION_HOLD", "CHECKSUM_FAILED", "PROJECT_WITHDRAWN"} <= kinds,
       str(kinds))
+
+# ---------- 11. 共享影像湖仓账单双路线分摊 ----------
+# 先重置为题设初始状态（A=3 分支、B=1 分支；读取 A 120GB / B 80GB）
+call("POST", "/cost-share/scenario/reset", token=H)
+share_bill = call("POST", "/cost-share/billing/generate", {"billingMonth": "2026-11"}, token=H)
+check("共享账单总额=19 元", money(share_bill["grandTotalFee"]) == 19.00,
+      f"grand={money(share_bill['grandTotalFee'])}")
+for r in share_bill["reconciliation"]:
+    check(f"双路线对账通过（{r['method']}：分摊=总额）",
+          r["reconciled"] is True and money(r["allocatedTotal"]) == money(r["grandTotalFee"]),
+          str(r))
+
+sb = {(b["method"], b["projectCode"]): b for b in share_bill["bills"]}
+# 路线一：有效引用权重 3:1 → O1 A 7.50/B 2.50；项目合计 A 12.90、B 6.10
+check("权重路线 O1 按 3:1 分摊：A=7.50", money(sb[("REFERENCE_WEIGHT", "PROJ-A")]["sharedStorageFee"]) == 7.50)
+check("权重路线 O1 按 3:1 分摊：B=2.50", money(sb[("REFERENCE_WEIGHT", "PROJ-B")]["sharedStorageFee"]) == 2.50)
+check("权重路线项目合计 A=12.90（7.50+3.00+2.40）",
+      money(sb[("REFERENCE_WEIGHT", "PROJ-A")]["totalFee"]) == 12.90,
+      str(sb[("REFERENCE_WEIGHT", "PROJ-A")]))
+check("权重路线项目合计 B=6.10（2.50+2.00+1.60）",
+      money(sb[("REFERENCE_WEIGHT", "PROJ-B")]["totalFee"]) == 6.10)
+# 路线二：Shapley 边际成本 → O1 各 5.00；项目合计 A 10.40、B 8.60
+check("Shapley 路线 O1 各承担 5.00（移除单项目省不下共享基础成本）",
+      money(sb[("SHAPLEY", "PROJ-A")]["sharedStorageFee"]) == 5.00
+      and money(sb[("SHAPLEY", "PROJ-B")]["sharedStorageFee"]) == 5.00)
+check("Shapley 路线项目合计 A=10.40", money(sb[("SHAPLEY", "PROJ-A")]["totalFee"]) == 10.40)
+check("Shapley 路线项目合计 B=8.60", money(sb[("SHAPLEY", "PROJ-B")]["totalFee"]) == 8.60)
+# 读取费/专属费两路线一致且按项目直接归属
+for m in ("REFERENCE_WEIGHT", "SHAPLEY"):
+    check(f"{m} 读取费直接归属 A=2.40/B=1.60",
+          money(sb[(m, "PROJ-A")]["readFee"]) == 2.40
+          and money(sb[(m, "PROJ-B")]["readFee"]) == 1.60)
+    check(f"{m} 专属资源账 A=3.00/B=2.00",
+          money(sb[(m, "PROJ-A")]["exclusiveStorageFee"]) == 3.00
+          and money(sb[(m, "PROJ-B")]["exclusiveStorageFee"]) == 2.00)
+# O1 对象级明细：权重 0.75/0.25；Shapley 平均边际成本各 5
+o1_alloc = [a for a in share_bill["allocations"] if a["uid"] == "O1"]
+o1w = {a["projectCode"]: a for a in o1_alloc if a["method"] == "REFERENCE_WEIGHT"}
+o1s = {a["projectCode"]: a for a in o1_alloc if a["method"] == "SHAPLEY"}
+check("O1 引用权重 A=0.75/B=0.25",
+      abs(float(o1w["PROJ-A"]["weight"]) - 0.75) < 1e-9
+      and abs(float(o1w["PROJ-B"]["weight"]) - 0.25) < 1e-9)
+check("O1 Shapley 平均边际成本各=5.00",
+      money(o1s["PROJ-A"]["marginalCost"]) == 5.00
+      and money(o1s["PROJ-B"]["marginalCost"]) == 5.00)
+# 字节时长账：3 对象 × 30 天 = 90 行，O1 月费合计精确 10 元
+bh = call("GET", "/cost-share/ledger/byte-hours?billingMonth=2026-11", token=H)
+check("字节时长账 3 对象×30 天=90 行", len(bh) == 90, f"rows={len(bh)}")
+check("O1 字节时长账月存储费合计=10.00",
+      money(sum(r["storageCharge"] for r in bh if r["uid"] == "O1")) == 10.00)
+excl = call("GET", "/cost-share/ledger/exclusive?billingMonth=2026-11", token=H)
+check("专属资源账 DERIV-A=3.00/DERIV-B=2.00",
+      {r["uid"]: money(r["storageFee"]) for r in excl} == {"DERIV-A": 3.00, "DERIV-B": 2.00})
+
+# 撤销 B 的最后一个引用：本月快照不变，下一周期 O1 仅属 A
+rev = call("POST", "/cost-share/membership/revoke",
+           {"objectUid": "O1", "projectCode": "PROJ-B", "effectiveMonth": "2026-12"}, token=H)
+check("撤销引用登记为下月生效且本月快照不变",
+      rev["effectiveMonth"] == "2026-12" and rev["currentMonthSnapshot"] == "UNCHANGED")
+nov = call("POST", "/cost-share/billing/generate", {"billingMonth": "2026-11"}, token=H)
+nov_b = {b["projectCode"]: b for b in nov["bills"] if b["method"] == "REFERENCE_WEIGHT"}
+check("撤销后 2026-11 账单不变（A=12.90/B=6.10）",
+      money(nov_b["PROJ-A"]["totalFee"]) == 12.90 and money(nov_b["PROJ-B"]["totalFee"]) == 6.10)
+nov_snap = {s["projectCode"]: s for s in call("GET", "/cost-share/snapshots?billingMonth=2026-11", token=H)}
+check("2026-11 成员快照仍含 PROJ-B", nov_snap["PROJ-B"]["member"] is True)
+dec = call("POST", "/cost-share/billing/generate", {"billingMonth": "2026-12"}, token=H)
+dec_b = {b["projectCode"]: b for b in dec["bills"] if b["method"] == "REFERENCE_WEIGHT"}
+check("2026-12 O1 全部 10 元归 A、B 不再分摊共享费",
+      money(dec_b["PROJ-A"]["sharedStorageFee"]) == 10.00
+      and money(dec_b["PROJ-B"]["sharedStorageFee"]) == 0.00)
+check("2026-12 单成员联盟两路线仍对账", all(r["reconciled"] for r in dec["reconciliation"]))
+dec_snap = {s["projectCode"]: s for s in call("GET", "/cost-share/snapshots?billingMonth=2026-12", token=H)}
+check("2026-12 快照 PROJ-B 已退出联盟", dec_snap["PROJ-B"]["member"] is False)
+# 恢复 B 引用 → 仍有其他项目引用时按新成员集重算回 3:1（在未冻结的新账期 2027-01 生效）
+call("POST", "/cost-share/membership/add",
+     {"objectUid": "O1", "projectCode": "PROJ-B", "referenceCount": 1, "effectiveMonth": "2027-01"}, token=H)
+jan = call("POST", "/cost-share/billing/generate", {"billingMonth": "2027-01"}, token=H)
+jan_w = {b["projectCode"]: b for b in jan["bills"] if b["method"] == "REFERENCE_WEIGHT"}
+check("恢复引用后新账期按新成员集重算：O1 回到 A 7.50/B 2.50",
+      money(jan_w["PROJ-A"]["sharedStorageFee"]) == 7.50
+      and money(jan_w["PROJ-B"]["sharedStorageFee"]) == 2.50)
+# 已冻结的 2026-12 账期不受恢复引用影响（快照不可变）
+dec_frozen = call("GET", "/cost-share/billing?billingMonth=2026-12", token=H)
+dec_frozen_b = {b["projectCode"]: b for b in dec_frozen if b["method"] == "REFERENCE_WEIGHT"}
+check("已出账的 2026-12 快照/账单保持不可变（B 分摊仍为 0）",
+      money(dec_frozen_b["PROJ-B"]["sharedStorageFee"]) == 0.00)
+# 读取量直接归属：把 A 调整为 100GB → 读取费 2.00，总额变为 18.60
+call("POST", "/cost-share/read-usage",
+     {"billingMonth": "2026-11", "projectCode": "PROJ-A", "readGb": 100, "note": "e2e 调整读取量"}, token=H)
+adj = call("POST", "/cost-share/billing/generate", {"billingMonth": "2026-11"}, token=H)
+check("读取量按项目直接归属（A=100GB→2.00，总额 18.60 仍对账）",
+      money(adj["grandTotalFee"]) == 18.60 and all(r["reconciled"] for r in adj["reconciliation"]))
+# 重置回题设初始状态并复算 19 元
+call("POST", "/cost-share/scenario/reset", token=H)
+back = call("POST", "/cost-share/billing/generate", {"billingMonth": "2026-11"}, token=H)
+check("场景重置后恢复题设 19 元与 A=12.90/B=6.10",
+      money(back["grandTotalFee"]) == 19.00
+      and money({b["projectCode"]: b for b in back["bills"]
+                 if b["method"] == "REFERENCE_WEIGHT"}["PROJ-A"]["totalFee"]) == 12.90)
 
 # ---------- 汇总 ----------
 print("\n================ 验证汇总 ================")

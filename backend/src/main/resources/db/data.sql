@@ -138,3 +138,57 @@ SELECT t.id, k.id, t.owning_project_id, true,
 FROM data_object t, data_object k
 WHERE t.object_uid='RESULT-A01' AND k.object_uid='PKG-RESULT-A01'
   AND NOT EXISTS (SELECT 1 FROM restore_package rp WHERE rp.package_object_id = k.id);
+
+-- ============================================================
+-- 共享影像湖仓账单分摊样例（题设：总账单 19 元；1GB=10^9B，月=30天）
+-- 共享源影像 O1：100GB × 0.10 = 10 元；专属派生 DERIV-A 30GB=3 元、DERIV-B 20GB=2 元；
+-- 读取服务费 0.02 元/GB：A 读 120GB=2.40 元、B 读 80GB=1.60 元。
+-- 有效引用：PROJ-A 3 个研究分支、PROJ-B 1 个研究分支引用 O1。
+-- ============================================================
+
+-- ---------- 分摊场景（费率版本 RV-2026Q4） ----------
+INSERT INTO share_scenario (code, name, storage_rate, read_gb_rate, rate_version, days_per_month)
+VALUES ('SCEN-IMGLAKE', '共享影像湖仓月度账单分摊（O1 源影像）', 0.100, 0.020, 'RV-2026Q4', 30)
+ON CONFLICT (code) DO NOTHING;
+
+-- ---------- 分摊对象 ----------
+INSERT INTO share_object (scenario_id, object_uid, name, byte_size, object_kind, owning_project_id)
+SELECT sc.id, v.uid, v.name, v.bytes, v.kind,
+       CASE WHEN v.pcode IS NULL THEN NULL ELSE (SELECT id FROM project WHERE code = v.pcode) END
+FROM (VALUES
+  ('O1',      '共享源影像 O1（100GB，A/B 共同引用）', 100000000000, 'SHARED',    NULL),
+  ('DERIV-A', '项目A 专属派生对象（30GB）',             30000000000, 'EXCLUSIVE', 'PROJ-A'),
+  ('DERIV-B', '项目B 专属派生对象（20GB）',             20000000000, 'EXCLUSIVE', 'PROJ-B')
+) AS v(uid, name, bytes, kind, pcode)
+CROSS JOIN share_scenario sc
+WHERE sc.code = 'SCEN-IMGLAKE'
+  AND NOT EXISTS (SELECT 1 FROM share_object so
+                  WHERE so.scenario_id = sc.id AND so.object_uid = v.uid);
+
+-- ---------- 对象-项目有效引用意愿（2026-11 账期初始状态：A=3 分支，B=1 分支） ----------
+INSERT INTO membership_intent (scenario_id, object_id, project_id, active_reference_count, effective_from, note)
+SELECT sc.id, so.id, p.id, v.cnt, '2026-11', v.note
+FROM (VALUES
+  ('O1', 'PROJ-A', 3, '研究A 3 个有效研究分支引用 O1'),
+  ('O1', 'PROJ-B', 1, '研究B 1 个有效研究分支引用 O1')
+) AS v(uid, pcode, cnt, note)
+JOIN share_scenario sc ON sc.code = 'SCEN-IMGLAKE'
+JOIN share_object so ON so.scenario_id = sc.id AND so.object_uid = v.uid
+JOIN project p ON p.code = v.pcode
+WHERE NOT EXISTS (
+  SELECT 1 FROM membership_intent mi
+  WHERE mi.scenario_id = sc.id AND mi.object_id = so.id AND mi.project_id = p.id);
+
+-- ---------- 读取量账（2026-11 初始：A 120GB、B 80GB） ----------
+INSERT INTO read_usage_ledger (scenario_id, billing_month, project_id, read_gb, read_gb_rate, read_fee, note)
+SELECT sc.id, '2026-11', p.id, v.gb, sc.read_gb_rate,
+       (v.gb * sc.read_gb_rate), v.note
+FROM (VALUES
+  ('PROJ-A', 120.000, '研究A 本月读取 120GB'),
+  ('PROJ-B',  80.000, '研究B 本月读取 80GB')
+) AS v(pcode, gb, note)
+JOIN share_scenario sc ON sc.code = 'SCEN-IMGLAKE'
+JOIN project p ON p.code = v.pcode
+WHERE NOT EXISTS (
+  SELECT 1 FROM read_usage_ledger r
+  WHERE r.scenario_id = sc.id AND r.billing_month = '2026-11' AND r.project_id = p.id);

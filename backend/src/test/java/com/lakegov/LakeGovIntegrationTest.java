@@ -152,4 +152,143 @@ class LakeGovIntegrationTest {
         assertNotNull(rows);
         assertTrue(rows > 0);
     }
+
+    // ---------- 共享影像湖仓账单双路线分摊 ----------
+
+    private Map postShare(String path, Object body) {
+        return rest.exchange("/api/cost-share" + path, HttpMethod.POST,
+                new HttpEntity<>(body, auth()), Map.class).getBody();
+    }
+
+    private Map[] getShare(String path) {
+        return rest.exchange("/api/cost-share" + path, HttpMethod.GET,
+                new HttpEntity<>(auth()), Map[].class).getBody();
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Map> billsByMethod(Map billing) {
+        Map<String, Map> out = new java.util.HashMap<>();
+        for (Map b : (List<Map>) billing.get("bills")) {
+            out.put(b.get("method") + ":" + b.get("projectCode"), b);
+        }
+        return out;
+    }
+
+    @Test
+    @Order(9)
+    void shareBillingDualMethodsBothReconcileToNineteen() {
+        HttpHeaders h = auth();
+        postShare("/scenario/reset", Map.of());
+        Map billing = postShare("/billing/generate", Map.of("billingMonth", "2026-11"));
+        // 总额 19 元，两路线均对账通过
+        assertEquals(19.0, ((Number) billing.get("grandTotalFee")).doubleValue(), 1e-9);
+        @SuppressWarnings("unchecked")
+        List<Map> recs = (List<Map>) billing.get("reconciliation");
+        assertEquals(2, recs.size());
+        recs.forEach(r -> assertEquals(Boolean.TRUE, r.get("reconciled")));
+
+        Map<String, Map> byKey = billsByMethod(billing);
+        // 路线一：有效引用权重 3:1 → A 12.90、B 6.10
+        Map wA = byKey.get("REFERENCE_WEIGHT:PROJ-A");
+        Map wB = byKey.get("REFERENCE_WEIGHT:PROJ-B");
+        assertEquals(7.50, ((Number) wA.get("sharedStorageFee")).doubleValue(), 1e-9);
+        assertEquals(12.90, ((Number) wA.get("totalFee")).doubleValue(), 1e-9);
+        assertEquals(2.50, ((Number) wB.get("sharedStorageFee")).doubleValue(), 1e-9);
+        assertEquals(6.10, ((Number) wB.get("totalFee")).doubleValue(), 1e-9);
+        // 读取费与专属费直接归属
+        assertEquals(2.40, ((Number) wA.get("readFee")).doubleValue(), 1e-9);
+        assertEquals(1.60, ((Number) wB.get("readFee")).doubleValue(), 1e-9);
+        assertEquals(3.00, ((Number) wA.get("exclusiveStorageFee")).doubleValue(), 1e-9);
+        assertEquals(2.00, ((Number) wB.get("exclusiveStorageFee")).doubleValue(), 1e-9);
+
+        // 路线二：Shapley 边际成本 → O1 各 5 元 → A 10.40、B 8.60
+        Map sA = byKey.get("SHAPLEY:PROJ-A");
+        Map sB = byKey.get("SHAPLEY:PROJ-B");
+        assertEquals(5.00, ((Number) sA.get("sharedStorageFee")).doubleValue(), 1e-9);
+        assertEquals(10.40, ((Number) sA.get("totalFee")).doubleValue(), 1e-9);
+        assertEquals(5.00, ((Number) sB.get("sharedStorageFee")).doubleValue(), 1e-9);
+        assertEquals(8.60, ((Number) sB.get("totalFee")).doubleValue(), 1e-9);
+
+        // O1 对象级明细：权重 0.75/0.25；Shapley 平均边际成本各 5
+        @SuppressWarnings("unchecked")
+        List<Map> allocations = (List<Map>) billing.get("allocations");
+        Map<String, Map> o1 = new java.util.HashMap<>();
+        for (Map a : allocations) {
+            if ("O1".equals(a.get("uid"))) {
+                o1.put(a.get("method") + ":" + a.get("projectCode"), a);
+            }
+        }
+        Map o1WeightB = o1.get("REFERENCE_WEIGHT:PROJ-B");
+        assertEquals(0.25, ((Number) o1WeightB.get("weight")).doubleValue(), 1e-9);
+        Map o1ShapleyA = o1.get("SHAPLEY:PROJ-A");
+        assertEquals(5.00, ((Number) o1ShapleyA.get("marginalCost")).doubleValue(), 1e-9);
+        assertEquals(5.00, ((Number) o1ShapleyA.get("allocatedFee")).doubleValue(), 1e-9);
+
+        // 字节时长账：3 对象 × 30 天 = 90 行；O1 月费合计 10 元
+        Map[] ledger = getShare("/ledger/byte-hours?billingMonth=2026-11");
+        assertEquals(90, ledger.length);
+        double o1Charge = java.util.Arrays.stream(ledger)
+                .filter(r -> "O1".equals(r.get("uid")))
+                .mapToDouble(r -> ((Number) r.get("storageCharge")).doubleValue()).sum();
+        assertEquals(10.0, o1Charge, 1e-6);
+    }
+
+    @Test
+    @Order(10)
+    void revokeLastReferenceKeepsCurrentMonthAndRecomputesNextPeriod() {
+        // 撤销 B 对 O1 的最后引用，下一周期生效
+        Map revoked = postShare("/membership/revoke",
+                Map.of("objectUid", "O1", "projectCode", "PROJ-B", "effectiveMonth", "2026-12"));
+        assertEquals("UNCHANGED", revoked.get("currentMonthSnapshot"));
+
+        // 本月（2026-11）快照与账单不变
+        Map nov = postShare("/billing/generate", Map.of("billingMonth", "2026-11"));
+        Map<String, Map> novBills = billsByMethod(nov);
+        assertEquals(12.90, ((Number) novBills.get("REFERENCE_WEIGHT:PROJ-A").get("totalFee")).doubleValue(), 1e-9);
+        assertEquals(6.10, ((Number) novBills.get("REFERENCE_WEIGHT:PROJ-B").get("totalFee")).doubleValue(), 1e-9);
+        Map[] novSnap = getShare("/snapshots?billingMonth=2026-11");
+        Map bNov = java.util.Arrays.stream(novSnap)
+                .filter(s -> "PROJ-B".equals(s.get("projectCode"))).findFirst().orElseThrow();
+        assertEquals(Boolean.TRUE, bNov.get("member"));
+
+        // 下一周期（2026-12）：O1 仅属 A，A 承担全部 10 元，B 不再分摊共享费
+        Map dec = postShare("/billing/generate", Map.of("billingMonth", "2026-12"));
+        Map<String, Map> decBills = billsByMethod(dec);
+        Map aDec = decBills.get("REFERENCE_WEIGHT:PROJ-A");
+        Map bDec = decBills.get("REFERENCE_WEIGHT:PROJ-B");
+        assertEquals(10.00, ((Number) aDec.get("sharedStorageFee")).doubleValue(), 1e-9);
+        assertEquals(0.00, ((Number) bDec.get("sharedStorageFee")).doubleValue(), 1e-9);
+        assertEquals(2.00, ((Number) bDec.get("exclusiveStorageFee")).doubleValue(), 1e-9);
+        // 单成员联盟下两条路线结果相同且仍对账
+        @SuppressWarnings("unchecked")
+        List<Map> recs = (List<Map>) dec.get("reconciliation");
+        recs.forEach(r -> assertEquals(Boolean.TRUE, r.get("reconciled")));
+        Map[] decSnap = getShare("/snapshots?billingMonth=2026-12");
+        Map bDecSnap = java.util.Arrays.stream(decSnap)
+                .filter(s -> "PROJ-B".equals(s.get("projectCode"))).findFirst().orElseThrow();
+        assertEquals(Boolean.FALSE, bDecSnap.get("member"));
+    }
+
+    @Test
+    @Order(11)
+    void readUsageDirectAttributionAndScenarioReset() {
+        // 录入读取量直接归属项目：A 读取 100GB → 2.00 元
+        postShare("/read-usage", Map.of("billingMonth", "2026-11",
+                "projectCode", "PROJ-A", "readGb", 100, "note", "junit 调整读取量"));
+        Map billing = postShare("/billing/generate", Map.of("billingMonth", "2026-11"));
+        Map a = billsByMethod(billing).get("REFERENCE_WEIGHT:PROJ-A");
+        assertEquals(2.00, ((Number) a.get("readFee")).doubleValue(), 1e-9);
+        // 总额随读取费变化：存储 15 + 读取 (2.00 + 1.60) = 18.60，仍对账
+        assertEquals(18.60, ((Number) billing.get("grandTotalFee")).doubleValue(), 1e-9);
+
+        // 恢复 B 引用（新成员集重算），再重置回题设初始状态
+        postShare("/membership/add", Map.of("objectUid", "O1", "projectCode", "PROJ-B",
+                "referenceCount", 1, "effectiveMonth", "2026-12"));
+        Map reset = postShare("/scenario/reset", Map.of());
+        assertEquals(Boolean.TRUE, reset.get("reset"));
+        Map back = postShare("/billing/generate", Map.of("billingMonth", "2026-11"));
+        assertEquals(19.0, ((Number) back.get("grandTotalFee")).doubleValue(), 1e-9);
+        assertEquals(12.90,
+                ((Number) billsByMethod(back).get("REFERENCE_WEIGHT:PROJ-A").get("totalFee")).doubleValue(), 1e-9);
+    }
 }

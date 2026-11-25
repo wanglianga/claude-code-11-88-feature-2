@@ -205,3 +205,158 @@ CREATE TABLE IF NOT EXISTS governance_event (
     affected_uids   JSONB,
     created_at      TIMESTAMP NOT NULL DEFAULT now()
 );
+
+-- ============================================================
+-- 共享影像湖仓账单分摊模块（按月分摊；双路线：有效引用权重 / Shapley 边际成本）
+-- 计量口径：1 GB = 10^9 字节，月按 30 天
+-- ============================================================
+
+-- ---------- 分摊场景（题设样例 SCEN-IMGLAKE） ----------
+CREATE TABLE IF NOT EXISTS share_scenario (
+    id                BIGSERIAL PRIMARY KEY,
+    code              VARCHAR(32) NOT NULL UNIQUE,
+    name              VARCHAR(256) NOT NULL,
+    storage_rate      NUMERIC(12,6) NOT NULL,        -- 归档/存储费 元/GB·月
+    read_gb_rate      NUMERIC(12,6) NOT NULL,        -- 读取服务费 元/GB
+    rate_version      VARCHAR(32) NOT NULL DEFAULT 'RV-2026Q4',
+    days_per_month    INT NOT NULL DEFAULT 30,
+    created_at        TIMESTAMP NOT NULL DEFAULT now()
+);
+
+-- ---------- 纳入分摊的对象（共享对象 + 项目专属派生对象） ----------
+CREATE TABLE IF NOT EXISTS share_object (
+    id                BIGSERIAL PRIMARY KEY,
+    scenario_id       BIGINT NOT NULL REFERENCES share_scenario(id),
+    object_uid        VARCHAR(64) NOT NULL,
+    name              VARCHAR(256) NOT NULL,
+    byte_size         BIGINT NOT NULL CHECK (byte_size >= 0),
+    object_kind       VARCHAR(16) NOT NULL CHECK (object_kind IN ('SHARED','EXCLUSIVE')),
+    owning_project_id BIGINT REFERENCES project(id),   -- EXCLUSIVE 时必填
+    UNIQUE (scenario_id, object_uid)
+);
+
+-- ---------- 对象-项目有效引用（成员关系的当前意愿状态） ----------
+CREATE TABLE IF NOT EXISTS membership_intent (
+    id                BIGSERIAL PRIMARY KEY,
+    scenario_id       BIGINT NOT NULL REFERENCES share_scenario(id),
+    object_id         BIGINT NOT NULL REFERENCES share_object(id),
+    project_id        BIGINT NOT NULL REFERENCES project(id),
+    active_reference_count INT NOT NULL DEFAULT 0 CHECK (active_reference_count >= 0),
+    effective_from    CHAR(7) NOT NULL,               -- 该意愿状态生效账期 YYYY-MM
+    note              VARCHAR(256),
+    UNIQUE (scenario_id, object_id, project_id)
+);
+
+-- ---------- 成员关系变更流水（撤销引用等；本月快照不变，下一周期重算） ----------
+CREATE TABLE IF NOT EXISTS membership_change (
+    id                BIGSERIAL PRIMARY KEY,
+    scenario_id       BIGINT NOT NULL REFERENCES share_scenario(id),
+    object_id         BIGINT NOT NULL REFERENCES share_object(id),
+    project_id        BIGINT NOT NULL REFERENCES project(id),
+    change_type       VARCHAR(24) NOT NULL CHECK (change_type IN ('REFERENCE_ADDED','REFERENCE_REVOKED')),
+    effective_month   CHAR(7) NOT NULL,               -- 变更实际生效的账期
+    requested_at      TIMESTAMP NOT NULL DEFAULT now(),
+    detail            VARCHAR(512)
+);
+CREATE INDEX IF NOT EXISTS idx_mchg_eff ON membership_change(scenario_id, effective_month);
+
+-- ---------- 对象-项目成员月度快照（账期冻结；出账不可变） ----------
+CREATE TABLE IF NOT EXISTS membership_snapshot (
+    id                BIGSERIAL PRIMARY KEY,
+    scenario_id       BIGINT NOT NULL REFERENCES share_scenario(id),
+    billing_month     CHAR(7) NOT NULL,
+    object_id         BIGINT NOT NULL REFERENCES share_object(id),
+    project_id        BIGINT NOT NULL REFERENCES project(id),
+    reference_count   INT NOT NULL,                   -- 冻结时的有效研究分支数
+    member            BOOLEAN NOT NULL,               -- 该账期是否为联盟成员
+    captured_at       TIMESTAMP NOT NULL DEFAULT now(),
+    UNIQUE (scenario_id, billing_month, object_id, project_id)
+);
+
+-- ---------- 字节时长账（对象 × 天；byte_hours = bytes × 24） ----------
+CREATE TABLE IF NOT EXISTS byte_hour_ledger (
+    id                BIGSERIAL PRIMARY KEY,
+    scenario_id       BIGINT NOT NULL REFERENCES share_scenario(id),
+    billing_month     CHAR(7) NOT NULL,
+    object_id         BIGINT NOT NULL REFERENCES share_object(id),
+    day               DATE NOT NULL,
+    byte_hours        NUMERIC(20,3) NOT NULL,
+    gb_month_rate     NUMERIC(12,6) NOT NULL,         -- 费率版本快照
+    storage_charge    NUMERIC(14,6) NOT NULL,         -- 当日存储费 = GB×月费率/30
+    UNIQUE (scenario_id, object_id, day)
+);
+
+-- ---------- 读取量账（项目 × 账期；读取服务费按项目读取 GB 直接归属，不分摊） ----------
+CREATE TABLE IF NOT EXISTS read_usage_ledger (
+    id                BIGSERIAL PRIMARY KEY,
+    scenario_id       BIGINT NOT NULL REFERENCES share_scenario(id),
+    billing_month     CHAR(7) NOT NULL,
+    project_id        BIGINT NOT NULL REFERENCES project(id),
+    read_gb           NUMERIC(18,6) NOT NULL CHECK (read_gb >= 0),
+    read_gb_rate      NUMERIC(12,6) NOT NULL,
+    read_fee          NUMERIC(14,6) NOT NULL,
+    note              VARCHAR(256),
+    UNIQUE (scenario_id, billing_month, project_id)
+);
+
+-- ---------- 专属资源账（项目独占派生对象的存储费，直接归属） ----------
+CREATE TABLE IF NOT EXISTS exclusive_resource_ledger (
+    id                BIGSERIAL PRIMARY KEY,
+    scenario_id       BIGINT NOT NULL REFERENCES share_scenario(id),
+    billing_month     CHAR(7) NOT NULL,
+    object_id         BIGINT NOT NULL REFERENCES share_object(id),
+    project_id        BIGINT NOT NULL REFERENCES project(id),
+    byte_size         BIGINT NOT NULL,
+    gb_month_rate     NUMERIC(12,6) NOT NULL,
+    storage_fee       NUMERIC(14,6) NOT NULL,
+    UNIQUE (scenario_id, billing_month, object_id)
+);
+
+-- ---------- 共享对象分摊明细（双路线，每对象每项目一行/路线） ----------
+CREATE TABLE IF NOT EXISTS share_allocation (
+    id                BIGSERIAL PRIMARY KEY,
+    scenario_id       BIGINT NOT NULL REFERENCES share_scenario(id),
+    billing_month     CHAR(7) NOT NULL,
+    object_id         BIGINT NOT NULL REFERENCES share_object(id),
+    project_id        BIGINT NOT NULL REFERENCES project(id),
+    method            VARCHAR(20) NOT NULL
+                      CHECK (method IN ('REFERENCE_WEIGHT','SHAPLEY')),
+    weight            NUMERIC(12,6) NOT NULL,         -- 引用权重路线=分支占比；Shapley=1/N
+    reference_count   INT NOT NULL,
+    marginal_cost     NUMERIC(14,6),                  -- Shapley 平均边际成本（权重路线为空）
+    allocated_fee     NUMERIC(14,6) NOT NULL,
+    detail_json       JSONB NOT NULL,
+    UNIQUE (scenario_id, billing_month, object_id, project_id, method)
+);
+
+-- ---------- 项目共享账单（按账期 × 项目 × 路线） ----------
+CREATE TABLE IF NOT EXISTS share_monthly_bill (
+    id                BIGSERIAL PRIMARY KEY,
+    scenario_id       BIGINT NOT NULL REFERENCES share_scenario(id),
+    billing_month     CHAR(7) NOT NULL,
+    project_id        BIGINT NOT NULL REFERENCES project(id),
+    method            VARCHAR(20) NOT NULL
+                      CHECK (method IN ('REFERENCE_WEIGHT','SHAPLEY')),
+    shared_storage_fee    NUMERIC(14,6) NOT NULL,     -- 共享对象分摊额
+    exclusive_storage_fee NUMERIC(14,6) NOT NULL,     -- 专属派生对象存储费
+    read_fee              NUMERIC(14,6) NOT NULL,     -- 读取服务费
+    total_fee             NUMERIC(14,6) NOT NULL,
+    detail_json       JSONB NOT NULL,
+    UNIQUE (scenario_id, billing_month, project_id, method)
+);
+
+-- ---------- 对账约束（每账期每路线：项目账单合计必须等于账单总额 19 元） ----------
+CREATE TABLE IF NOT EXISTS share_reconciliation (
+    id                BIGSERIAL PRIMARY KEY,
+    scenario_id       BIGINT NOT NULL REFERENCES share_scenario(id),
+    billing_month     CHAR(7) NOT NULL,
+    method            VARCHAR(20) NOT NULL
+                      CHECK (method IN ('REFERENCE_WEIGHT','SHAPLEY')),
+    total_storage_fee NUMERIC(14,6) NOT NULL,         -- 共享+专属存储费总额
+    total_read_fee    NUMERIC(14,6) NOT NULL,
+    grand_total_fee   NUMERIC(14,6) NOT NULL,
+    allocated_total   NUMERIC(14,6) NOT NULL,         -- 项目账单加总
+    reconciled        BOOLEAN NOT NULL,
+    checked_at        TIMESTAMP NOT NULL DEFAULT now(),
+    UNIQUE (scenario_id, billing_month, method)
+);
